@@ -19,6 +19,7 @@ data/raw/
 data/external/
 *.csv
 *.parquet
+!data/sample_10k.parquet
 *.pkl
 *.h5
 !data/.gitkeep
