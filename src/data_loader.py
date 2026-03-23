@@ -11,19 +11,20 @@ Each row represents ONE notification event: one user received one push notificat
 at one point in time. The columns are:
   - datetime: float (days since dataset start)
   - ui_language: str (user's language)
-  - eligible_templates: list of str (which templates A-L could be sent)
-  - history: list of tuples (previously sent templates and when)
+  - eligible_templates: numpy array of str (which templates A-L could be sent)
+  - history: numpy array of dicts with keys 'template' and 'n_days'
   - selected_template: str (which template was actually sent)
-  - session_end_completed: int 0 or 1 (did the user complete a lesson within 2 hours?)
+  - session_end_completed: bool (did the user complete a lesson within 2 hours?)
 
 WHY WE NEED THIS:
   The raw data is split across multiple parquet files. We need a clean way to:
   1. Load just a sample (for development — 200M rows is too much for testing)
   2. Load full train or test sets (for final evaluation)
-  3. Parse the history column (which may be encoded as strings)
+  3. Parse the history and eligible_templates columns (stored as numpy arrays)
 """
 
 import pandas as pd
+import numpy as np
 import glob
 import os
 import ast
@@ -32,8 +33,6 @@ import ast
 # ---------------------------------------------------------------------------
 # Path configuration
 # ---------------------------------------------------------------------------
-# We use relative paths from the project root. If you run scripts from
-# a different directory, adjust DATA_DIR accordingly.
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "raw")
 
 
@@ -46,11 +45,6 @@ def get_parquet_files(split="train"):
 
     Returns:
         list of file paths, sorted alphabetically
-
-    Example:
-        >>> files = get_parquet_files("train")
-        >>> print(files)
-        ['data/raw/train-part-1/xxx.parquet', 'data/raw/train-part-2/xxx.parquet', ...]
     """
     pattern = os.path.join(DATA_DIR, f"{split}-part-*", "*.parquet")
     files = sorted(glob.glob(pattern))
@@ -69,38 +63,53 @@ def parse_history(history_value):
     """
     Parse the history column into a list of (template, days_ago) tuples.
 
-    The history column in the parquet files might be stored as:
-      - A Python list of tuples (already parsed)
-      - A string representation of a list (needs ast.literal_eval)
-      - None or empty (no history for this user)
+    The history column in the parquet files can be stored as:
+      - A numpy ndarray of dicts: [{'template': 'A', 'n_days': 1.2}, ...]
+      - A Python list of dicts or tuples
+      - A string representation (needs ast.literal_eval)
+      - None or empty
 
     Args:
         history_value: the raw value from the history column
 
     Returns:
         list of (template_str, days_ago_float) tuples, or empty list
-
-    Example:
-        >>> parse_history([("A", 1.2), ("F", 3.5)])
-        [("A", 1.2), ("F", 3.5)]
-
-        >>> parse_history(None)
-        []
     """
-    # If it's None or NaN, return empty
+    # None or NaN
     if history_value is None:
         return []
 
-    # If it's already a list, return as-is
-    if isinstance(history_value, list):
-        return history_value
+    # Handle numpy ndarray (most common format from parquet)
+    if isinstance(history_value, np.ndarray):
+        result = []
+        for entry in history_value:
+            if isinstance(entry, dict):
+                t = entry.get("template", "")
+                d = entry.get("n_days", 0.0)
+                result.append((t, float(d)))
+            elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                result.append((str(entry[0]), float(entry[1])))
+        return result
 
-    # If it's a string, try to parse it
+    # Handle Python list
+    if isinstance(history_value, list):
+        result = []
+        for entry in history_value:
+            if isinstance(entry, dict):
+                t = entry.get("template", "")
+                d = entry.get("n_days", 0.0)
+                result.append((t, float(d)))
+            elif isinstance(entry, (list, tuple)) and len(entry) == 2:
+                result.append((str(entry[0]), float(entry[1])))
+        return result
+
+    # Handle string representation
     if isinstance(history_value, str):
         if history_value.strip() == "" or history_value.strip() == "[]":
             return []
         try:
-            return ast.literal_eval(history_value)
+            parsed = ast.literal_eval(history_value)
+            return parse_history(parsed)  # recurse to handle the parsed result
         except (ValueError, SyntaxError):
             return []
 
@@ -111,8 +120,10 @@ def parse_eligible_templates(eligible_value):
     """
     Parse the eligible_templates column into a list of template strings.
 
-    Similar to history, this might be stored in different formats depending
-    on the parquet serialization.
+    The column can be stored as:
+      - A numpy ndarray of strings: array(['A', 'C', 'F'], dtype=object)
+      - A Python list of strings
+      - A string representation
 
     Args:
         eligible_value: raw value from eligible_templates column
@@ -122,6 +133,10 @@ def parse_eligible_templates(eligible_value):
     """
     if eligible_value is None:
         return []
+
+    # Handle numpy ndarray (most common from parquet)
+    if isinstance(eligible_value, np.ndarray):
+        return eligible_value.tolist()
 
     if isinstance(eligible_value, list):
         return eligible_value
@@ -137,13 +152,33 @@ def parse_eligible_templates(eligible_value):
     return []
 
 
+def _postprocess(df):
+    """
+    Fix column types after loading from parquet.
+
+    - session_end_completed: convert bool → int (0/1) for numeric operations
+    - eligible_templates: convert ndarray → list for consistency
+    """
+    # Convert bool reward to int so .mean(), .sum() etc. work as expected
+    if df["session_end_completed"].dtype == bool:
+        df["session_end_completed"] = df["session_end_completed"].astype(int)
+
+    # Convert eligible_templates ndarray → list for each row
+    if len(df) > 0 and isinstance(df["eligible_templates"].iloc[0], np.ndarray):
+        df["eligible_templates"] = df["eligible_templates"].apply(
+            lambda x: x.tolist() if isinstance(x, np.ndarray) else x
+        )
+
+    # Convert history ndarray of dicts → list of (template, days_ago) tuples
+    if len(df) > 0 and isinstance(df["history"].iloc[0], np.ndarray):
+        df["history"] = df["history"].apply(parse_history)
+
+    return df
+
+
 def load_sample(n_rows=100_000, split="train"):
     """
     Load a small sample of the data for development and testing.
-
-    WHY: The full dataset is ~200M rows. You don't want to wait 10 minutes
-    every time you test a small code change. Start with 100K rows, get your
-    code working, then scale up.
 
     Args:
         n_rows: how many rows to load (default 100K)
@@ -154,12 +189,31 @@ def load_sample(n_rows=100_000, split="train"):
     """
     files = get_parquet_files(split)
 
-    # Read only from the first file, and only n_rows
     print(f"[data_loader] Loading {n_rows:,} sample rows from {os.path.basename(files[0])}...")
-    df = pd.read_parquet(files[0])
 
-    # Take the first n_rows (or all if the file has fewer)
-    df = df.head(n_rows).copy()
+    # Use pyarrow to read only n_rows instead of the entire file
+    try:
+        import pyarrow.parquet as pq
+        pf = pq.ParquetFile(files[0])
+        # Read row groups until we have enough rows
+        batches = []
+        rows_so_far = 0
+        for i in range(pf.metadata.num_row_groups):
+            if rows_so_far >= n_rows:
+                break
+            batch = pf.read_row_group(i)
+            batches.append(batch)
+            rows_so_far += batch.num_rows
+        table = __import__("pyarrow").concat_tables(batches)
+        df = table.to_pandas()
+        df = df.head(n_rows).copy()
+    except ImportError:
+        # Fallback if pyarrow not available as module but pandas can still read
+        df = pd.read_parquet(files[0])
+        df = df.head(n_rows).copy()
+
+    # Post-process column types
+    df = _postprocess(df)
 
     print(f"[data_loader] Loaded {len(df):,} rows")
     print(f"[data_loader] Columns: {list(df.columns)}")
@@ -185,13 +239,13 @@ def load_full(split="train"):
 
     print(f"[data_loader] Loading full '{split}' dataset from {len(files)} files...")
 
-    # Read each parquet file and concatenate
     dfs = []
     for i, f in enumerate(files):
         print(f"  Reading file {i + 1}/{len(files)}: {os.path.basename(f)}...")
         dfs.append(pd.read_parquet(f))
 
     df = pd.concat(dfs, ignore_index=True)
+    df = _postprocess(df)
 
     print(f"[data_loader] Loaded {len(df):,} rows total")
     print(f"[data_loader] Memory usage: {df.memory_usage(deep=True).sum() / 1e6:.1f} MB")
@@ -244,11 +298,11 @@ def describe_dataset(df):
     print(f"  Type of first value: {type(sample_hist).__name__}")
     print(f"  First value: {sample_hist}")
 
-    # Find a row with non-empty history for better understanding
+    # Find a row with non-empty history
     for i in range(min(100, len(df))):
         h = df['history'].iloc[i]
-        if h is not None and (isinstance(h, list) and len(h) > 0) or (isinstance(h, str) and h != "[]"):
-            print(f"  Example non-empty history (row {i}): {h}")
+        if isinstance(h, list) and len(h) > 0:
+            print(f"  Example non-empty history (row {i}): {h[:3]}")
             break
 
     print("=" * 60)
