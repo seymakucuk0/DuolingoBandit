@@ -33,7 +33,7 @@ import ast
 # ---------------------------------------------------------------------------
 # Path configuration
 # ---------------------------------------------------------------------------
-DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "raw")
+DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
 
 
 def get_parquet_files(split="train"):
@@ -46,13 +46,18 @@ def get_parquet_files(split="train"):
     Returns:
         list of file paths, sorted alphabetically
     """
-    pattern = os.path.join(DATA_DIR, f"{split}-part-*", "*.parquet")
-    files = sorted(glob.glob(pattern))
+    # Support both folder patterns:
+    # 1. data/train-part-*.parquet (direct files)
+    # 2. data/train-part-*/*.parquet (subfolders)
+    pattern1 = os.path.join(DATA_DIR, f"{split}-part-*.parquet")
+    pattern2 = os.path.join(DATA_DIR, f"{split}-part-*", "*.parquet")
+    
+    files = sorted(list(set(glob.glob(pattern1) + glob.glob(pattern2))))
 
     if len(files) == 0:
         raise FileNotFoundError(
             f"No parquet files found for split='{split}' in {DATA_DIR}. "
-            f"Make sure you extracted the tar.gz files into data/raw/"
+            f"Expected files matching {split}-part-*.parquet"
         )
 
     print(f"[data_loader] Found {len(files)} parquet files for '{split}' split")
@@ -157,20 +162,23 @@ def _postprocess(df):
     Fix column types after loading from parquet.
 
     - session_end_completed: convert bool → int (0/1) for numeric operations
-    - eligible_templates: convert ndarray → list for consistency
+    - eligible_templates: convert ndarray/str/list → standard list of strings
+    - history: convert ndarray/str/list → list of (template, days_ago) tuples
     """
+    if len(df) == 0:
+        return df
+
     # Convert bool reward to int so .mean(), .sum() etc. work as expected
-    if df["session_end_completed"].dtype == bool:
-        df["session_end_completed"] = df["session_end_completed"].astype(int)
+    if "session_end_completed" in df.columns:
+        if df["session_end_completed"].dtype == bool:
+            df["session_end_completed"] = df["session_end_completed"].astype(int)
 
-    # Convert eligible_templates ndarray → list for each row
-    if len(df) > 0 and isinstance(df["eligible_templates"].iloc[0], np.ndarray):
-        df["eligible_templates"] = df["eligible_templates"].apply(
-            lambda x: x.tolist() if isinstance(x, np.ndarray) else x
-        )
+    # Use the robust parsing functions for every row
+    # This ensures consistency whether data comes from parquet dicts, arrays, or strings
+    if "eligible_templates" in df.columns:
+        df["eligible_templates"] = df["eligible_templates"].apply(parse_eligible_templates)
 
-    # Convert history ndarray of dicts → list of (template, days_ago) tuples
-    if len(df) > 0 and isinstance(df["history"].iloc[0], np.ndarray):
+    if "history" in df.columns:
         df["history"] = df["history"].apply(parse_history)
 
     return df
@@ -204,7 +212,9 @@ def load_sample(n_rows=100_000, split="train"):
             batch = pf.read_row_group(i)
             batches.append(batch)
             rows_so_far += batch.num_rows
-        table = __import__("pyarrow").concat_tables(batches)
+        
+        import pyarrow as pa
+        table = pa.concat_tables(batches)
         df = table.to_pandas()
         df = df.head(n_rows).copy()
     except ImportError:
