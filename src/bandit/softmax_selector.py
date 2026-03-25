@@ -19,13 +19,14 @@ THE SOFTMAX SOLUTION:
   Instead of always picking the best, we assign probabilities to each template
   based on their scores, then SAMPLE from that distribution.
 
-  P(a) = exp(τ × score(a)) / Σ exp(τ × score(t))   for all eligible t
+  P(a) = exp(score(a) / τ) / Σ exp(score(t) / τ)   for all eligible t
 
-  The temperature parameter τ controls the balance:
-    - τ → 0:    uniform random (pure exploration, every template equally likely)
-    - τ → ∞:    always pick the highest-scored (pure exploitation, greedy)
-    - τ = 10:   moderate — best templates are more likely but others still get tried
-    - τ = 50:   aggressive — strongly favors high scores but not fully greedy
+  The temperature parameter τ controls the balance (paper convention):
+    - τ → 0:    always pick the highest-scored (pure exploitation, greedy)
+    - τ → ∞:    uniform random (pure exploration)
+    - τ = 0.0025: near-greedy (paper's best offline result)
+    - τ = 0.01:   moderate exploration
+    - τ = 0.02:   more exploration
 
   EXAMPLE (3 templates with scores 0.05, 0.02, -0.01):
     τ = 1:   P = [0.37, 0.34, 0.29]  — almost uniform
@@ -69,8 +70,12 @@ def softmax_probabilities(eligible_templates, adjusted_scores, tau):
     # Get scores for eligible templates only
     scores = np.array([adjusted_scores.get(t, 0.0) for t in eligible_templates])
 
-    # Multiply by temperature
-    scaled = tau * scores
+    # Divide by temperature (paper convention: smaller tau = more greedy)
+    if tau > 0:
+        scaled = scores / tau
+    else:
+        # tau=0 means argmax — give huge weight to best
+        scaled = scores * 1e10
 
     # Subtract max for numerical stability (prevents overflow in exp)
     scaled = scaled - np.max(scaled)
@@ -162,7 +167,7 @@ def explain_softmax_selection(eligible_templates, adjusted_scores, tau):
     print(f"[softmax] Eligible templates: {eligible_templates}")
 
     scores = np.array([adjusted_scores.get(t, 0.0) for t in eligible_templates])
-    scaled = tau * scores
+    scaled = scores / tau if tau > 0 else scores * 1e10
     shifted = scaled - np.max(scaled)
     exp_vals = np.exp(shifted)
     total = np.sum(exp_vals)

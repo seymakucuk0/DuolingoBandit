@@ -17,20 +17,22 @@ THE SOLUTION — EXPONENTIAL DECAY PENALTY:
   We subtract a penalty from a template's score based on how recently it
   was sent to this specific user.
 
-  penalty(a) = γ × exp(-h × d)
+  penalty(a) = γ × 0.5^(d / h)
 
   Where:
     γ (gamma) = maximum penalty (applied when d=0, i.e., just sent)
-    h = decay rate (how fast the penalty fades)
+    h = half-life in days (when d=h, penalty is halved)
     d = days since template 'a' was last sent to this user
 
-  EXAMPLES (with γ=0.1, h=0.5):
-    Just sent (d=0):    penalty = 0.1 × exp(0) = 0.100  [maximum penalty]
-    Sent 1 day ago:     penalty = 0.1 × exp(-0.5) = 0.061
-    Sent 2 days ago:    penalty = 0.1 × exp(-1.0) = 0.037
-    Sent 5 days ago:    penalty = 0.1 × exp(-2.5) = 0.008  [almost gone]
-    Sent 10 days ago:   penalty = 0.1 × exp(-5.0) = 0.001  [negligible]
-    Never sent:         penalty = 0.0  [no penalty at all]
+  Paper defaults: γ = 0.017, h = 15 (days)
+
+  EXAMPLES (with γ=0.017, h=15):
+    Just sent (d=0):    penalty = 0.017 × 0.5^0     = 0.0170  [maximum]
+    Sent 1 day ago:     penalty = 0.017 × 0.5^(1/15) = 0.0162
+    Sent 7 days ago:    penalty = 0.017 × 0.5^(7/15) = 0.0119
+    Sent 15 days ago:   penalty = 0.017 × 0.5^1      = 0.0085  [halved]
+    Sent 30 days ago:   penalty = 0.017 × 0.5^2      = 0.0043
+    Never sent:         penalty = 0.0
 
   The template "recovers" over time — hence the name "Recovering Bandit."
 
@@ -95,8 +97,9 @@ def compute_recency_penalty(template, history, gamma, h):
     if most_recent is None:
         return 0.0
 
-    # Apply the exponential decay formula
-    penalty = gamma * math.exp(-h * most_recent)
+    # Apply the half-life decay formula (paper Equation 3)
+    # penalty = gamma * 0.5^(d / h)
+    penalty = gamma * math.pow(0.5, most_recent / h) if h > 0 else 0.0
     return penalty
 
 

@@ -28,18 +28,24 @@ This class is the main thing you'll interact with.
 """
 
 import numpy as np
+from collections import defaultdict
 from tqdm import tqdm
 
 # Import all our components
 from src.scoring.difference_score import (
     compute_template_reward_rates,
+    compute_counterfactual_baseline,
     compute_relative_difference_scores_fast,
+    compute_rds_paper,
+    compute_rds_paper_chunked_pass1,
+    merge_rds_accumulators,
 )
 from src.scoring.bayesian_smoothing import bayesian_smooth
 from src.recency.recency_penalty import adjust_scores_with_recency
 from src.bandit.softmax_selector import softmax_probabilities, softmax_select
 from src.evaluation.baseline import compute_random_baseline, compute_lift
 from src.evaluation.importance_sampling import (
+    compute_logging_probability,
     compute_importance_weights,
     weighted_importance_sampling,
 )
@@ -76,11 +82,26 @@ class RDSPolicy:
                        Range: 1-100. Start with 50.
     """
 
-    def __init__(self, kappa=1000, gamma=0.1, h=0.5, tau=50):
+    def __init__(self, kappa=1000, gamma=0.017, h=15, tau=0.0025,
+                 use_smoothing=False, use_argmax=True):
+        """
+        Args:
+            kappa: Bayesian shrinkage strength (only used if use_smoothing=True)
+            gamma: Recency penalty magnitude (paper default: 0.017)
+            h: Recency half-life in days (paper default: 15)
+            tau: Softmax temperature (paper convention: score/tau, smaller=greedier)
+                 Set use_argmax=True to ignore tau and use greedy selection.
+            use_smoothing: If False (default for offline eval), skip Bayesian smoothing.
+                           Paper Section 3.1: "we did not use empirical Bayes (sigma=0)"
+            use_argmax: If True (default), use greedy argmax for evaluation.
+                        Paper Section 3.1: "we used argmax instead of softmax"
+        """
         self.kappa = kappa
         self.gamma = gamma
         self.h = h
         self.tau = tau
+        self.use_smoothing = use_smoothing
+        self.use_argmax = use_argmax
 
         # These are set during fit()
         self.reward_rates = None
@@ -88,6 +109,10 @@ class RDSPolicy:
         self.counts = None
         self.smoothed_scores = None
         self.is_fitted = False
+
+        # Language-specific scores (set by fit_chunked_by_language)
+        self.lang_smoothed_scores = {}  # {lang: {template: score}}
+        self.use_language = False
 
     def fit(self, df):
         """
@@ -126,19 +151,16 @@ class RDSPolicy:
         print("\n✓ Policy fitted successfully!")
         print(f"  Templates learned: {sorted(self.smoothed_scores.keys())}")
 
-    def get_probabilities(self, eligible_templates, history):
+    def get_probabilities(self, eligible_templates, history, language=None):
         """
         Compute the probability distribution over eligible templates
         for a specific event.
 
-        This is the core decision function:
-          1. Start with smoothed scores (from training)
-          2. Adjust for recency (based on this user's history)
-          3. Apply softmax over eligible templates only
-
         Args:
             eligible_templates: list of eligible template names
             history: list of (template, days_ago) tuples
+            language: optional ui_language string. If provided and language-
+                      specific scores exist, uses those instead of global.
 
         Returns:
             dict {template: probability}
@@ -146,21 +168,25 @@ class RDSPolicy:
         if not self.is_fitted:
             raise RuntimeError("Policy not fitted! Call fit() first.")
 
-        # Step 1: Get smoothed scores for eligible templates only
-        eligible_scores = {
-            t: self.smoothed_scores.get(t, 0.0)
-            for t in eligible_templates
-        }
+        # Pick language-specific or global scores
+        if self.use_language and language and language in self.lang_smoothed_scores:
+            scores = self.lang_smoothed_scores[language]
+        else:
+            scores = self.smoothed_scores
 
-        # Step 2: Apply recency penalty
+        eligible_scores = {t: scores.get(t, 0.0) for t in eligible_templates}
+
         adjusted_scores = adjust_scores_with_recency(
             eligible_scores, history, self.gamma, self.h
         )
 
-        # Step 3: Softmax selection probabilities
-        probs = softmax_probabilities(eligible_templates, adjusted_scores, self.tau)
-
-        return probs
+        if self.use_argmax:
+            # Greedy: probability 1.0 for best template, 0.0 for others
+            best = max(eligible_templates, key=lambda t: adjusted_scores.get(t, 0.0))
+            return {t: (1.0 if t == best else 0.0) for t in eligible_templates}
+        else:
+            probs = softmax_probabilities(eligible_templates, adjusted_scores, self.tau)
+            return probs
 
     def select_template(self, eligible_templates, history, rng=None):
         """
@@ -284,6 +310,263 @@ class RDSPolicy:
         print("=" * 60)
 
         return results
+
+    def fit_chunked(self, split="train", chunk_size=1_000_000):
+        """
+        Fit using paper-accurate RDS formula via chunked streaming.
+
+        Single pass: reads eligible_templates + selected_template + reward,
+        accumulates importance-weighted mu_plus/mu_minus per template.
+
+        Args:
+            split: "train" or "test"
+            chunk_size: rows per chunk (default 1M)
+        """
+        from src.data_loader import iter_parquet_chunks
+
+        print("=" * 60)
+        print("FITTING RDS POLICY (paper formula, chunked)")
+        print("=" * 60)
+
+        # ---- Single pass: compute paper RDS via chunked accumulators ----
+        print("\n--- Computing RDS scores (paper formula) ---")
+        accumulators = []
+
+        for chunk in iter_parquet_chunks(split, chunk_size,
+                                          columns=["eligible_templates", "selected_template",
+                                                   "session_end_completed"],
+                                          parse_eligible=True, parse_hist=False):
+            acc = compute_rds_paper_chunked_pass1(chunk)
+            accumulators.append(acc)
+            del chunk
+
+        self.rds_scores, self.counts = merge_rds_accumulators(accumulators)
+
+        # Compute reward rates from the accumulators
+        self.reward_rates = {}
+        total_plus_wr = defaultdict(float)
+        total_plus_w = defaultdict(float)
+        for acc in accumulators:
+            for t, v in acc["plus_wr_sum"].items():
+                total_plus_wr[t] += v
+            for t, v in acc["plus_w_sum"].items():
+                total_plus_w[t] += v
+        for t in total_plus_w:
+            self.reward_rates[t] = total_plus_wr[t] / total_plus_w[t] if total_plus_w[t] > 0 else 0.0
+
+        # ---- Bayesian Smoothing (optional — paper disables for offline eval) ----
+        if self.use_smoothing:
+            print("\n--- Applying Bayesian Smoothing ---")
+            self.smoothed_scores = bayesian_smooth(
+                self.rds_scores, self.counts, self.kappa
+            )
+        else:
+            print("\n--- Smoothing DISABLED (paper offline mode: sigma=0) ---")
+            self.smoothed_scores = dict(self.rds_scores)
+
+        self.is_fitted = True
+        print("\n✓ Policy fitted successfully!")
+        print(f"  Templates learned: {sorted(self.smoothed_scores.keys())}")
+
+    def fit_chunked_by_language(self, split="train", chunk_size=1_000_000,
+                                 min_lang_count=50_000):
+        """
+        Fit language-specific RDS scores using paper-accurate formula.
+
+        Single pass: for each chunk, split by language and accumulate
+        importance-weighted mu_plus/mu_minus per (language, template).
+        """
+        from src.data_loader import iter_parquet_chunks
+
+        print("=" * 60)
+        print("FITTING RDS POLICY BY LANGUAGE (paper formula, chunked)")
+        print("=" * 60)
+
+        # Accumulators per language and global
+        lang_accs = defaultdict(list)  # lang → list of chunk accumulators
+        global_accs = []
+
+        print("\n--- Computing per-language RDS (paper formula) ---")
+        for chunk in iter_parquet_chunks(split, chunk_size,
+                columns=["ui_language", "eligible_templates",
+                         "selected_template", "session_end_completed"],
+                parse_eligible=True, parse_hist=False):
+
+            # Global accumulator
+            global_accs.append(compute_rds_paper_chunked_pass1(chunk))
+
+            # Per-language accumulators
+            for lang, sub in chunk.groupby("ui_language"):
+                sub_reset = sub.reset_index(drop=True)
+                lang_accs[lang].append(compute_rds_paper_chunked_pass1(sub_reset))
+
+            del chunk
+
+        # Merge global
+        print("\nGlobal scores:")
+        self.rds_scores, self.counts = merge_rds_accumulators(global_accs)
+
+        # Determine qualified languages
+        lang_totals = {}
+        for lang, accs in lang_accs.items():
+            total = sum(sum(a["plus_count"].values()) for a in accs)
+            lang_totals[lang] = total
+
+        qualified = {l for l, n in lang_totals.items() if n >= min_lang_count}
+        total_q = sum(lang_totals[l] for l in qualified)
+        total_all = sum(lang_totals.values())
+        print(f"\n[fit] {len(qualified)} languages qualify (>= {min_lang_count:,} events)")
+        print(f"[fit] Coverage: {total_q:,} / {total_all:,} ({total_q/total_all:.1%})")
+
+        # Merge per-language
+        lang_rds = {}
+        lang_counts = {}
+        for lang in sorted(qualified):
+            n = lang_totals[lang]
+            print(f"\nLanguage '{lang}' ({n:,} events):")
+            scores, cnts = merge_rds_accumulators(lang_accs[lang])
+            lang_rds[lang] = scores
+            lang_counts[lang] = cnts
+
+        # Compute reward rates from global accumulators
+        self.reward_rates = {}
+        total_plus_wr = defaultdict(float)
+        total_plus_w = defaultdict(float)
+        for acc in global_accs:
+            for t, v in acc["plus_wr_sum"].items():
+                total_plus_wr[t] += v
+            for t, v in acc["plus_w_sum"].items():
+                total_plus_w[t] += v
+        for t in total_plus_w:
+            self.reward_rates[t] = total_plus_wr[t] / total_plus_w[t] if total_plus_w[t] > 0 else 0.0
+
+        # ---- Bayesian smoothing (optional) ----
+        if self.use_smoothing:
+            print("\n--- Applying Bayesian Smoothing ---")
+            self.smoothed_scores = bayesian_smooth(
+                self.rds_scores, self.counts, self.kappa)
+            self.lang_smoothed_scores = {}
+            for lang in sorted(qualified):
+                self.lang_smoothed_scores[lang] = bayesian_smooth(
+                    lang_rds[lang], lang_counts[lang], self.kappa)
+        else:
+            print("\n--- Smoothing DISABLED (paper offline mode) ---")
+            self.smoothed_scores = dict(self.rds_scores)
+            self.lang_smoothed_scores = {lang: dict(lang_rds[lang]) for lang in qualified}
+
+        self.use_language = True
+        self.is_fitted = True
+
+        print(f"\n✓ Policy fitted by language!")
+        print(f"  Languages with own scores: {len(self.lang_smoothed_scores)}")
+        print(f"  Global fallback for {len(lang_totals) - len(qualified)} rare languages")
+
+    def evaluate_chunked(self, split="test", chunk_size=500_000,
+                         max_weight=20, sample_size=None):
+        """
+        Evaluate the policy on test data by streaming chunks — low memory.
+
+        Accumulates the WIS numerator/denominator and baseline stats across
+        chunks so the full test set never needs to fit in memory at once.
+
+        Args:
+            split: "train" or "test"
+            chunk_size: rows per chunk
+            max_weight: clip importance weights
+            sample_size: if set, stop after this many rows (approximate)
+
+        Returns:
+            dict with baseline, target_value, lift, n_events
+        """
+        from src.data_loader import iter_parquet_chunks
+        import ast as _ast
+
+        if not self.is_fitted:
+            raise RuntimeError("Policy not fitted! Call fit() or fit_chunked() first.")
+
+        print("=" * 60)
+        print("EVALUATING RDS POLICY (chunked — low-memory mode)")
+        print("=" * 60)
+
+        # Accumulators
+        wis_numerator = 0.0
+        wis_denominator = 0.0
+        baseline_sum = 0.0
+        total_events = 0
+
+        for chunk in iter_parquet_chunks(split, chunk_size):
+            eligible_col = chunk["eligible_templates"].values
+            history_col = chunk["history"].values
+            selected_col = chunk["selected_template"].values
+            reward_col = chunk["session_end_completed"].values
+            lang_col = chunk["ui_language"].values if "ui_language" in chunk.columns else None
+
+            for i in range(len(chunk)):
+                eligible = eligible_col[i]
+                history = history_col[i]
+                selected = selected_col[i]
+                reward = float(reward_col[i])
+                language = lang_col[i] if lang_col is not None else None
+
+                if isinstance(eligible, str):
+                    eligible = _ast.literal_eval(eligible)
+                elif hasattr(eligible, 'tolist'):
+                    eligible = eligible.tolist()
+
+                if history is None:
+                    history = []
+                elif isinstance(history, str):
+                    history = _ast.literal_eval(history)
+                elif hasattr(history, 'tolist'):
+                    history = history.tolist()
+
+                # Logging probability (random)
+                p_log = 1.0 / max(len(eligible), 1)
+
+                # Target probability (RDS) — passes language for lang-specific scores
+                probs = self.get_probabilities(eligible, history, language=language)
+                p_target = probs.get(selected, 0.0)
+
+                w = p_target / p_log if p_log > 0 else 0.0
+                w = min(w, max_weight)
+
+                wis_numerator += w * reward
+                wis_denominator += w
+                baseline_sum += reward
+                total_events += 1
+
+            del chunk
+
+            print(f"[evaluate_chunked] Processed {total_events:,} events so far")
+
+            if sample_size is not None and total_events >= sample_size:
+                print(f"[evaluate_chunked] Reached sample_size={sample_size:,}, stopping.")
+                break
+
+        baseline = baseline_sum / total_events if total_events > 0 else 0.0
+        target_value = wis_numerator / wis_denominator if wis_denominator > 0 else 0.0
+        lift = (target_value - baseline) / baseline if baseline > 0 else 0.0
+
+        print(f"\n{'=' * 60}")
+        print("EVALUATION COMPLETE (chunked)")
+        print(f"{'=' * 60}")
+        print(f"  Random baseline:  {baseline:.6f}")
+        print(f"  RDS policy:       {target_value:.6f}")
+        print(f"  Lift:             {lift:+.4f} ({lift:+.2%})")
+        print(f"  Events evaluated: {total_events:,}")
+
+        return {
+            "baseline": baseline,
+            "target_value": target_value,
+            "lift": lift,
+            "n_events": total_events,
+            "hyperparameters": {
+                "kappa": self.kappa,
+                "gamma": self.gamma,
+                "h": self.h,
+                "tau": self.tau,
+            },
+        }
 
     def summary(self):
         """Print a summary of the fitted policy."""
